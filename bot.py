@@ -299,13 +299,18 @@ class Database:
         return [PaymentRequest(**dict(r)) for r in rows]
 
     async def approve_payment(self, payment_id: int) -> Optional[Tuple[int, int]]:
-        """Approves a payment and credits the user. Returns (user_id, amount) or None."""
+        """Approves a payment and credits the user. Returns (user_id, amount) or
+        None if the payment doesn't exist or was already processed (guards
+        against double-tapping the Approve button crediting a user twice)."""
         async with self._lock:
             now = datetime.now().isoformat()
-            await self._conn.execute(
+            cur = await self._conn.execute(
                 "UPDATE payment_requests SET status = 'approved', processed_at = ? WHERE id = ? AND status = 'pending'",
                 (now, payment_id),
             )
+            if cur.rowcount == 0:
+                await self._conn.commit()
+                return None
             cur = await self._conn.execute(
                 "SELECT user_id, amount FROM payment_requests WHERE id = ?", (payment_id,)
             )
@@ -546,6 +551,13 @@ def kb_invite() -> InlineKeyboardMarkup:
 
 def kb_cancel() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="nav:main")]])
+
+
+def kb_payment_review(payment_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Approve", callback_data=f"adm_appr:{payment_id}"),
+        InlineKeyboardButton("❌ Reject", callback_data=f"adm_rej:{payment_id}"),
+    ]])
 
 
 def kb_admin() -> InlineKeyboardMarkup:
@@ -918,7 +930,8 @@ async def handle_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         async def notify(admin_id: int):
             try:
                 await context.bot.send_photo(
-                    admin_id, photo=InputFile(file_path), caption=caption, parse_mode=ParseMode.MARKDOWN
+                    admin_id, photo=InputFile(file_path), caption=caption,
+                    parse_mode=ParseMode.MARKDOWN, reply_markup=kb_payment_review(payment_id),
                 )
             except TelegramError as e:
                 logger.warning(f"admin notify failed for {admin_id}: {e}")
@@ -987,14 +1000,45 @@ async def cb_admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         if not payments:
             await query.edit_message_text("✅ No pending payments.", reply_markup=kb_admin())
             return ADMIN_MENU
-        msg = "💰 *Pending Payments*\n\n"
-        for p in payments[:10]:
+
+        SHOW_LIMIT = 8
+        await query.edit_message_text(
+            f"💰 *{len(payments)} Pending Payment(s)*\n\nSending screenshots below 👇",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
+        for p in payments[:SHOW_LIMIT]:
             u = await db.get_user(p.user_id)
             name = f"@{md_escape(u.username)}" if u and u.username else f"ID {p.user_id}"
-            msg += f"`#{p.id}` — {name} — *{p.amount} Birr*\n"
-        if len(payments) > 10:
-            msg += f"\n… and {len(payments) - 10} more"
-        await query.edit_message_text(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=kb_admin())
+            caption = (
+                f"💰 *Payment #{p.id}*\n\n"
+                f"👤 {name}\n"
+                f"🆔 `{p.user_id}`\n"
+                f"💳 Amount: *{p.amount} Birr*\n"
+                f"📅 {p.created_at}"
+            )
+            try:
+                if p.screenshot_path and os.path.exists(p.screenshot_path):
+                    await context.bot.send_photo(
+                        update.effective_chat.id,
+                        photo=InputFile(p.screenshot_path),
+                        caption=caption,
+                        parse_mode=ParseMode.MARKDOWN,
+                        reply_markup=kb_payment_review(p.id),
+                    )
+                else:
+                    await context.bot.send_message(
+                        update.effective_chat.id,
+                        f"{caption}\n\n⚠️ _Screenshot file not found_",
+                        parse_mode=ParseMode.MARKDOWN,
+                        reply_markup=kb_payment_review(p.id),
+                    )
+            except TelegramError as e:
+                logger.warning(f"Failed to show payment #{p.id} to admin: {e}")
+
+        remaining = len(payments) - SHOW_LIMIT
+        footer = f"… and {remaining} more pending — use ✅ Approve / ❌ Reject with the ID." if remaining > 0 else "That's all the pending payments."
+        await context.bot.send_message(update.effective_chat.id, footer, reply_markup=kb_admin())
         return ADMIN_MENU
 
     if action == "approve":
@@ -1165,6 +1209,62 @@ async def handle_admin_text_input(update: Update, context: ContextTypes.DEFAULT_
     return ADMIN_MENU
 
 
+# ===== QUICK APPROVE/REJECT (global — works from any screen, incl. payment photo buttons) =====
+async def cb_quick_approve(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    admin = await db.get_user(update.effective_user.id)
+    if not is_admin_cached_user(admin):
+        await query.answer("⛔ Access denied.", show_alert=True)
+        return
+    payment_id = int(query.data.split(":", 1)[1])
+    result = await db.approve_payment(payment_id)
+    if not result:
+        await query.answer("⚠️ Already processed or not found.", show_alert=True)
+        return
+    target_id, amount = result
+    await query.answer("✅ Approved!")
+    done_note = f"\n\n✅ *Approved* by admin at {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+    try:
+        if query.message.caption:
+            await query.edit_message_caption(caption=query.message.caption + done_note, parse_mode=ParseMode.MARKDOWN)
+        else:
+            await query.edit_message_text(query.message.text + done_note, parse_mode=ParseMode.MARKDOWN)
+    except TelegramError:
+        pass
+    await safe_send(
+        context.bot, target_id,
+        text=f"✅ *Payment Approved!*\n\n💰 {amount} Birr credited.\nUse /start to download PDFs.",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+async def cb_quick_reject(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    admin = await db.get_user(update.effective_user.id)
+    if not is_admin_cached_user(admin):
+        await query.answer("⛔ Access denied.", show_alert=True)
+        return
+    payment_id = int(query.data.split(":", 1)[1])
+    target_id = await db.reject_payment(payment_id)
+    if not target_id:
+        await query.answer("⚠️ Already processed or not found.", show_alert=True)
+        return
+    await query.answer("❌ Rejected.")
+    done_note = f"\n\n❌ *Rejected* by admin at {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+    try:
+        if query.message.caption:
+            await query.edit_message_caption(caption=query.message.caption + done_note, parse_mode=ParseMode.MARKDOWN)
+        else:
+            await query.edit_message_text(query.message.text + done_note, parse_mode=ParseMode.MARKDOWN)
+    except TelegramError:
+        pass
+    await safe_send(
+        context.bot, target_id,
+        text="❌ *Payment Rejected*\n\nContact support if you believe this is a mistake.",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
 # ===== FALLBACK / CANCEL =====
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
@@ -1266,6 +1366,11 @@ def main():
     )
 
     app.add_handler(conv_handler)
+    # Separate group: payment approve/reject buttons must work even if the
+    # admin's conversation state is somewhere else (e.g. they tapped the
+    # button on a notification message sent outside the current flow).
+    app.add_handler(CallbackQueryHandler(cb_quick_approve, pattern=r"^adm_appr:"), group=1)
+    app.add_handler(CallbackQueryHandler(cb_quick_reject, pattern=r"^adm_rej:"), group=1)
     app.add_error_handler(error_handler)
 
     logger.info("Bot polling started.")
