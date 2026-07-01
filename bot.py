@@ -231,11 +231,12 @@ class Database:
 
     async def create_user(self, user: User, invited_by: Optional[int] = None) -> UserData:
         now = datetime.now().isoformat()
+        is_admin_flag = int(user.id in ADMIN_IDS)
         async with self._lock:
             await self._conn.execute(
-                """INSERT INTO users (user_id, username, first_name, last_name, created_at, updated_at, invited_by)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (user.id, user.username or "", user.first_name or "", user.last_name or "", now, now, invited_by),
+                """INSERT INTO users (user_id, username, first_name, last_name, created_at, updated_at, invited_by, is_admin)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (user.id, user.username or "", user.first_name or "", user.last_name or "", now, now, invited_by, is_admin_flag),
             )
             if invited_by:
                 await self._conn.execute(
@@ -439,7 +440,11 @@ api_client: Optional[FaydaAPIClient] = None
 
 # ============ HELPERS ============
 def is_admin_cached_user(user: Optional[UserData]) -> bool:
-    return bool(user and user.is_admin)
+    """Admin status is true if either the DB flag is set OR the user's id is
+    in ADMIN_IDS. This makes ADMIN_IDS authoritative and self-healing even if
+    the user was created before being added to ADMIN_IDS, or the bot booted
+    before they ever sent /start."""
+    return bool(user and (user.is_admin or user.user_id in ADMIN_IDS))
 
 
 def get_user_credit(user: UserData) -> int:
@@ -503,7 +508,7 @@ def kb_main(user: UserData) -> InlineKeyboardMarkup:
          InlineKeyboardButton("📞 Support", callback_data="menu:support")],
         [InlineKeyboardButton("ℹ️ Help", callback_data="menu:help")],
     ]
-    if user.is_admin:
+    if is_admin_cached_user(user):
         rows.append([InlineKeyboardButton("⚙️ Admin Panel", callback_data="menu:admin")])
     return InlineKeyboardMarkup(rows)
 
