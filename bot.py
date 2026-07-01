@@ -473,7 +473,7 @@ def format_user_status(user: UserData) -> str:
         f"👤 *Your Profile*\n"
         f"━━━━━━━━━━━━━━\n"
         f"🆔 `{user.user_id}`\n"
-        f"📛 {user.first_name} {user.last_name or ''}\n"
+        f"📛 {md_escape(user.first_name)} {md_escape(user.last_name) or ''}\n"
         f"💰 Balance: *{user.balance} Birr*\n"
         f"📄 PDF Credits: *{credit_display}*{unlimited}\n"
         f"📥 Total Downloads: *{user.total_downloads}*\n"
@@ -496,6 +496,20 @@ async def safe_send(bot, chat_id: int, **kwargs) -> bool:
 
 def mask_fan(fan: str) -> str:
     return f"{fan[:4]}****{fan[-4:]}"
+
+
+_MD_SPECIAL = ("_", "*", "`", "[")
+
+
+def md_escape(text: Optional[str]) -> str:
+    """Escapes legacy-Markdown special characters in untrusted text (Telegram
+    usernames/names can contain _ * ` [ which otherwise break parse_mode=Markdown
+    and make the whole message fail to send)."""
+    if not text:
+        return text
+    for ch in _MD_SPECIAL:
+        text = text.replace(ch, "\\" + ch)
+    return text
 
 
 # ============ KEYBOARDS ============
@@ -595,7 +609,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         )
 
         if ADMIN_IDS:
-            mention = f"@{user.username}" if user.username else f"[{user.first_name}](tg://user?id={user_id})"
+            mention = f"@{md_escape(user.username)}" if user.username else f"[{md_escape(user.first_name)}](tg://user?id={user_id})"
             text = (
                 f"🆕 *New User Joined!*\n\n👤 {mention}\n🆔 `{user_id}`\n"
                 f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M')}"
@@ -606,7 +620,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             ))
     else:
         await update.message.reply_text(
-            f"👋 Welcome back, {user.first_name}!",
+            f"👋 Welcome back, {md_escape(user.first_name)}!",
             reply_markup=kb_main(existing),
         )
 
@@ -895,7 +909,7 @@ async def handle_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if ADMIN_IDS:
         caption = (
             f"💰 *New Payment Request #{payment_id}*\n\n"
-            f"👤 @{update.effective_user.username or 'N/A'}\n"
+            f"👤 @{md_escape(update.effective_user.username) or 'N/A'}\n"
             f"🆔 `{user_id}`\n"
             f"💳 Amount: {amount} Birr\n"
             f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M')}"
@@ -976,7 +990,7 @@ async def cb_admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         msg = "💰 *Pending Payments*\n\n"
         for p in payments[:10]:
             u = await db.get_user(p.user_id)
-            name = f"@{u.username}" if u and u.username else f"ID {p.user_id}"
+            name = f"@{md_escape(u.username)}" if u and u.username else f"ID {p.user_id}"
             msg += f"`#{p.id}` — {name} — *{p.amount} Birr*\n"
         if len(payments) > 10:
             msg += f"\n… and {len(payments) - 10} more"
@@ -1006,7 +1020,7 @@ async def cb_admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
             status_icon = "🚫" if u.is_banned else "🟢"
             credit = get_user_credit(u)
             credit_str = "♾️" if credit >= 999_999 else str(credit)
-            msg += f"{status_icon} `{u.user_id}` @{u.username or 'N/A'} 📄{credit_str}\n"
+            msg += f"{status_icon} `{u.user_id}` @{md_escape(u.username) or 'N/A'} 📄{credit_str}\n"
         if len(users) > 25:
             msg += f"\n… and {len(users) - 25} more"
         await query.edit_message_text(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=kb_admin())
