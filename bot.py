@@ -933,10 +933,23 @@ async def handle_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                     admin_id, photo=InputFile(file_path), caption=caption,
                     parse_mode=ParseMode.MARKDOWN, reply_markup=kb_payment_review(payment_id),
                 )
+            except Forbidden:
+                logger.error(
+                    f"Cannot notify admin {admin_id}: they have never started a chat with this bot. "
+                    f"Ask them to send /start to the bot at least once — Telegram blocks bots from "
+                    f"messaging a user first."
+                )
             except TelegramError as e:
-                logger.warning(f"admin notify failed for {admin_id}: {e}")
+                logger.exception(f"Photo notify failed for admin {admin_id}, trying text fallback")
+                await safe_send(
+                    context.bot, admin_id,
+                    text=caption + "\n\n⚠️ _Screenshot delivery failed — check /start status or logs._",
+                    parse_mode=ParseMode.MARKDOWN, reply_markup=kb_payment_review(payment_id),
+                )
 
         await asyncio.gather(*(notify(a) for a in ADMIN_IDS))
+    else:
+        logger.warning("No ADMIN_IDS configured — payment request will not be shown to anyone!")
 
     context.user_data.clear()
     return MAIN_MENU
@@ -1304,6 +1317,25 @@ async def post_init(application: Application):
         if u and not u.is_admin:
             u.is_admin = True
             await db.update_user(u)
+
+    if not ADMIN_IDS:
+        logger.warning("ADMIN_IDS is empty — no one will receive payment notifications or admin access!")
+
+    for admin_id in ADMIN_IDS:
+        try:
+            await application.bot.send_message(
+                admin_id, "🤖 Bot restarted and online. Payment approval requests will be sent here."
+            )
+            logger.info(f"Admin {admin_id} is reachable — notifications will work.")
+        except Forbidden:
+            logger.error(
+                f"Admin {admin_id} is UNREACHABLE: they have never messaged this bot, or blocked it. "
+                f"They must open the bot in Telegram and send /start once — Telegram does not let "
+                f"bots message a user before that user has messaged the bot first."
+            )
+        except TelegramError as e:
+            logger.error(f"Admin {admin_id} reachability check failed: {e}")
+
     logger.info(f"Bot ready. Username: @{application.bot.username}")
 
 
