@@ -28,6 +28,7 @@ from telegram.ext import (
     MessageHandler, filters, ConversationHandler, ContextTypes,
 )
 from telegram.error import Forbidden, BadRequest, TelegramError
+from telegram.request import HTTPXRequest
 
 # ============ CONFIGURATION ============
 TOKEN = os.environ.get("BOT_TOKEN")
@@ -499,6 +500,95 @@ async def safe_send(bot, chat_id: int, **kwargs) -> bool:
         return False
 
 
+async def send_payment_screenshot(
+    bot, chat_id: int, screenshot_path: Optional[str], caption: str, reply_markup=None,
+) -> bool:
+    """Delivers a payment screenshot to an admin, with retries and graceful
+    degradation, so a slow upload or a transient Telegram/network hiccup
+    doesn't silently turn into a text-only notification.
+
+    Order of attempts:
+      1. send_photo (up to 2 tries, with a short backoff) — normal path.
+      2. send_document (uncompressed) — recovers cases where Telegram
+         rejects the file as a *photo* (bad dimensions/aspect ratio,
+         unsupported format) but the file itself is fine.
+      3. text-only fallback with the *actual* error attached, so the admin/
+         operator doesn't have to go spelunking through logs to find out why.
+
+    Returns True if the image itself was delivered (attempts 1 or 2).
+    """
+    if not screenshot_path or not os.path.exists(screenshot_path):
+        logger.error(f"Screenshot missing on disk: {screenshot_path!r}")
+        await safe_send(
+            bot, chat_id,
+            text=caption + "\n\n⚠️ _Screenshot file not found on disk._",
+            parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup,
+        )
+        return False
+
+    if os.path.getsize(screenshot_path) == 0:
+        logger.error(f"Screenshot is a 0-byte file: {screenshot_path!r}")
+        await safe_send(
+            bot, chat_id,
+            text=caption + "\n\n⚠️ _Screenshot file is empty (upload from user likely failed)._",
+            parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup,
+        )
+        return False
+
+    last_error: Optional[Exception] = None
+
+    # Attempt 1: send as photo (with one retry on transient/network errors).
+    for attempt in range(2):
+        try:
+            with open(screenshot_path, "rb") as fh:
+                await bot.send_photo(
+                    chat_id, photo=InputFile(fh), caption=caption,
+                    parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup,
+                    read_timeout=30, write_timeout=30, connect_timeout=15,
+                )
+            return True
+        except Forbidden:
+            logger.error(f"Cannot notify {chat_id}: bot is blocked or was never started by this user.")
+            return False
+        except BadRequest as e:
+            # Telegram rejected it *as a photo* (e.g. bad dimensions/aspect
+            # ratio) — retrying send_photo won't help, so break to try
+            # send_document instead.
+            logger.warning(f"send_photo BadRequest for {chat_id}: {e}")
+            last_error = e
+            break
+        except TelegramError as e:
+            logger.warning(f"send_photo attempt {attempt + 1} failed for {chat_id}: {e}")
+            last_error = e
+            await asyncio.sleep(1.5)
+
+    # Attempt 2: send as an uncompressed document — recovers from photo-only
+    # rejections (bad dimensions) and is generally more tolerant.
+    try:
+        with open(screenshot_path, "rb") as fh:
+            await bot.send_document(
+                chat_id, document=InputFile(fh), caption=caption,
+                parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup,
+                read_timeout=30, write_timeout=30, connect_timeout=15,
+            )
+        return True
+    except Forbidden:
+        logger.error(f"Cannot notify {chat_id}: bot is blocked or was never started by this user.")
+        return False
+    except TelegramError as e:
+        logger.exception(f"send_document fallback also failed for {chat_id}")
+        last_error = e
+
+    # Attempt 3: text-only, with the real error surfaced instead of a vague note.
+    err_detail = f"{type(last_error).__name__}: {last_error}" if last_error else "unknown error"
+    await safe_send(
+        bot, chat_id,
+        text=caption + f"\n\n⚠️ _Screenshot delivery failed ({md_escape(err_detail)[:200]})._",
+        parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup,
+    )
+    return False
+
+
 def mask_fan(fan: str) -> str:
     return f"{fan[:4]}****{fan[-4:]}"
 
@@ -928,24 +1018,11 @@ async def handle_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         )
 
         async def notify(admin_id: int):
-            try:
-                await context.bot.send_photo(
-                    admin_id, photo=InputFile(file_path), caption=caption,
-                    parse_mode=ParseMode.MARKDOWN, reply_markup=kb_payment_review(payment_id),
-                )
-            except Forbidden:
-                logger.error(
-                    f"Cannot notify admin {admin_id}: they have never started a chat with this bot. "
-                    f"Ask them to send /start to the bot at least once — Telegram blocks bots from "
-                    f"messaging a user first."
-                )
-            except TelegramError as e:
-                logger.exception(f"Photo notify failed for admin {admin_id}, trying text fallback")
-                await safe_send(
-                    context.bot, admin_id,
-                    text=caption + "\n\n⚠️ _Screenshot delivery failed — check /start status or logs._",
-                    parse_mode=ParseMode.MARKDOWN, reply_markup=kb_payment_review(payment_id),
-                )
+            delivered = await send_payment_screenshot(
+                context.bot, admin_id, file_path, caption, reply_markup=kb_payment_review(payment_id),
+            )
+            if not delivered:
+                logger.warning(f"Screenshot for payment #{payment_id} could not be image-delivered to admin {admin_id}.")
 
         await asyncio.gather(*(notify(a) for a in ADMIN_IDS))
     else:
@@ -1031,21 +1108,10 @@ async def cb_admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
                 f"📅 {p.created_at}"
             )
             try:
-                if p.screenshot_path and os.path.exists(p.screenshot_path):
-                    await context.bot.send_photo(
-                        update.effective_chat.id,
-                        photo=InputFile(p.screenshot_path),
-                        caption=caption,
-                        parse_mode=ParseMode.MARKDOWN,
-                        reply_markup=kb_payment_review(p.id),
-                    )
-                else:
-                    await context.bot.send_message(
-                        update.effective_chat.id,
-                        f"{caption}\n\n⚠️ _Screenshot file not found_",
-                        parse_mode=ParseMode.MARKDOWN,
-                        reply_markup=kb_payment_review(p.id),
-                    )
+                await send_payment_screenshot(
+                    context.bot, update.effective_chat.id, p.screenshot_path, caption,
+                    reply_markup=kb_payment_review(p.id),
+                )
             except TelegramError as e:
                 logger.warning(f"Failed to show payment #{p.id} to admin: {e}")
 
@@ -1353,9 +1419,15 @@ def main():
 
     threading.Thread(target=run_health_server, daemon=True).start()
 
+    # Generous timeouts: default PTB timeouts are short (~5s) and can cut off
+    # photo/document uploads (payment screenshots) on slower connections,
+    # which was silently degrading admin notifications to text-only.
+    request = HTTPXRequest(connect_timeout=15, read_timeout=30, write_timeout=30, pool_timeout=15)
+
     app = (
         Application.builder()
         .token(TOKEN)
+        .request(request)
         .post_init(post_init)
         .post_shutdown(post_shutdown)
         .build()
